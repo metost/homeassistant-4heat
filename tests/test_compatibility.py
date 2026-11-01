@@ -1,5 +1,7 @@
 """Freeze original entity and state naming contracts against accidental migration."""
 import ast
+import copy
+import textwrap
 import json
 from pathlib import Path
 import unittest
@@ -19,7 +21,13 @@ class CompatibilityTests(unittest.TestCase):
                         isinstance(t, ast.Name) and t.id == name for t in n.targets))]
                 with self.subTest(file=filename, name=name):
                     self.assertEqual(len(matches), 1)
-                    self.assertEqual(ast.dump(matches[0], include_attributes=False), frozen)
+                    actual = copy.deepcopy(matches[0])
+                    if isinstance(actual, ast.FunctionDef):
+                        self.assertEqual([d.id for d in actual.decorator_list], ['property'])
+                        actual.decorator_list = []
+                    baseline = ast.parse(textwrap.dedent(frozen)).body[0]
+                    self.assertEqual(ast.dump(actual, include_attributes=False),
+                                     ast.dump(baseline, include_attributes=False))
 
     def test_domain_and_config_flow_version_preserved(self):
         manifest = json.loads((ROOT/'custom_components/4heat/manifest.json').read_text())
