@@ -16,5 +16,18 @@
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Local communication",
+        "data": {
+          "active_interval": "Polling while active (seconds)",
+          "idle_interval": "Polling while off (seconds)",
+          "transaction_timeout": "Transaction timeout (seconds)",
+          "connection_settle": "Wait after connecting (seconds)"
+        }
+      }
+    }
   }
 }
