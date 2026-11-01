@@ -143,12 +143,16 @@ class FourHeatOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
         defaults = {"active_interval": 10, "idle_interval": 60,
-                    "transaction_timeout": 5, "connection_settle": 0.5}
+                    "transaction_timeout": 5, "connection_settle": 0.5,
+                    "supplemental_interval": 30}
         ranges = {"active_interval": (6, 60), "idle_interval": (10, 300),
-                  "transaction_timeout": (1, 15), "connection_settle": (0, 1)}
+                  "transaction_timeout": (1, 15), "connection_settle": (0, 1),
+                  "supplemental_interval": (10, 300)}
         schema = {}
         for key, default in defaults.items():
             numeric = float if key == "connection_settle" else int
             schema[vol.Required(key, default=self._entry.options.get(key, default))] = vol.All(
                 vol.Coerce(numeric), vol.Range(min=ranges[key][0], max=ranges[key][1]))
+        schema[vol.Optional("supplemental_telemetry", default=self._entry.options.get(
+            "supplemental_telemetry", False))] = bool
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

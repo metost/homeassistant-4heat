@@ -9,6 +9,10 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util.dt import utcnow
 from .const import DOMAIN, TCP_PORT, DATA_QUERY, ERROR_QUERY, CONF_MODE, MODES, MODE_TYPE, ERROR_TYPE
 from .transport import FourHeatTransport, ProtocolError, decode_registers
+from .supplemental import (
+    CONF_SUPPLEMENTAL, CONF_SUPPLEMENTAL_INTERVAL, SUPPLEMENTAL_QUERY,
+    decode_supplemental,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +33,12 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         self._failures = 0
         self.last_successful_update = None
         self.last_command_accepted = None
+        self.supplemental_enabled = options.get(CONF_SUPPLEMENTAL, False)
+        self.supplemental_interval = options.get(CONF_SUPPLEMENTAL_INTERVAL, 30)
+        self.supplemental_data = {}
+        self.supplemental_updated_at = None
+        self._supplemental_attempt = float("-inf")
+        self.fresh_registers = set()
         self.transport = FourHeatTransport(self._host, TCP_PORT,
             timeout=options.get("transaction_timeout", 5),
             settle=options.get("connection_settle", 0.5))
@@ -55,9 +65,28 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         self.last_successful_update = utcnow()
         interval = self.idle_interval if snapshot[MODE_TYPE][0] in (0, 8, 9) else self.active_interval
         self.update_interval = timedelta(seconds=interval)
+        self.fresh_registers = set(snapshot)
+        if self.supplemental_enabled:
+            await self._async_read_supplemental()
         # A partial SEC fallback may retain noncritical fields; all critical
         # fields above must be fresh. Never mutate published data in place.
         return {**(self.data or {}), **snapshot} if response[0] == "SEC" else snapshot
+
+    async def _async_read_supplemental(self):
+        """Optional failures must never invalidate required stove telemetry."""
+        now = asyncio.get_running_loop().time()
+        if now - self._supplemental_attempt < self.supplemental_interval:
+            return
+        self._supplemental_attempt = now
+        try:
+            response = await self.transport.request(SUPPLEMENTAL_QUERY)
+            self.supplemental_data = decode_supplemental(response)
+        except (OSError, asyncio.TimeoutError, ProtocolError) as err:
+            self.supplemental_data = {}
+            self.supplemental_updated_at = None
+            _LOGGER.debug("Optional SYEVO0000513 diagnostics unavailable: %s", err)
+        else:
+            self.supplemental_updated_at = utcnow()
 
     async def _command(self, payload):
         if payload is None:

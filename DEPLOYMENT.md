@@ -69,3 +69,30 @@ still required before treating this beta as production validated.
    the original entry/registries. Do not reset the integration to roll back.
 
 No HA files, room targets or automations were modified while developing this beta.
+
+
+## Optional SYEVO0000513 diagnostics (beta 2)
+
+Only enable `Read additional diagnostics (SYEVO0000513 only)` for product
+SYEVO0000513 version 1. This is an explicit model profile, not automatic discovery.
+It is OFF by default and saving options reloads the integration. Existing entities
+retain their names and unique IDs. Four new diagnostic entities distinguish
+selected pellet power (Auto = maximum manual setting + 1), actual power/status,
+auger reading and combustion fan reading.
+
+One read-only SEC packet with three I-prefixed registers is sent at most every
+30 seconds by default, during normal coordinator polls. With 10-second active
+polling this adds up to two local requests per minute. The actual interval can be
+longer when the main poll interval or failure backoff is longer. No new cloud
+requests or write actions are introduced. A failed extra query makes these extra
+readings unavailable, while successful normal state/water telemetry stays usable.
+
+Actual power 9 is P Mod on this profile. The auger reading uses the app's base
+signed type-5 /100 decoder and retains its raw register attribute. Its physical
+unit is deliberately unset: no fuel consumption, kW, duty percent or duration is
+inferred, and the map's additional multiplier is not applied without validation.
+The fan reading is also unitless pending validation. These are diagnostic values,
+not confirmed energy/performance measurements.
+
+Local read-only validation returned values for all three registers. The code has
+not been deployed to HA, and its options/entities still need an HA runtime check.

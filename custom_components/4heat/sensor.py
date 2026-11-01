@@ -31,6 +31,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
             except:
                 _LOGGER.debug(f"Error adding {sensorId}")
 
+    if coordinator.supplemental_enabled:
+        from .diagnostic_sensor import DESCRIPTIONS, FourHeatDiagnosticSensor
+        entities.extend(FourHeatDiagnosticSensor(coordinator, entry, key) for key in DESCRIPTIONS)
     async_add_entities(entities)
 
 

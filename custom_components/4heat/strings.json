@@ -25,7 +25,9 @@
           "active_interval": "Polling while active (seconds)",
           "idle_interval": "Polling while off (seconds)",
           "transaction_timeout": "Transaction timeout (seconds)",
-          "connection_settle": "Wait after connecting (seconds)"
+          "connection_settle": "Wait after connecting (seconds)",
+          "supplemental_telemetry": "Read additional diagnostics (SYEVO0000513 only)",
+          "supplemental_interval": "Additional diagnostics interval (seconds)"
         }
       }
     }
