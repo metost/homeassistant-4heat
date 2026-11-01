@@ -27,7 +27,11 @@
           "transaction_timeout": "Transaction timeout (seconds)",
           "connection_settle": "Wait after connecting (seconds)",
           "supplemental_telemetry": "Read additional diagnostics (SYEVO0000513 only)",
-          "supplemental_interval": "Additional diagnostics interval (seconds)"
+          "supplemental_interval": "Additional diagnostics interval (seconds)",
+          "direct_telemetry": "Read state, error and water temperature directly (opt in)",
+          "direct_interval": "Minimum interval between direct reads (seconds)",
+          "active_backoff_max": "Maximum retry interval while active (seconds)",
+          "command_confirmation_timeout": "Wait for observed command result (seconds)"
         }
       }
     }

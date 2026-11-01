@@ -144,10 +144,12 @@ class FourHeatOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=user_input)
         defaults = {"active_interval": 10, "idle_interval": 60,
                     "transaction_timeout": 5, "connection_settle": 0.5,
-                    "supplemental_interval": 30}
+                    "supplemental_interval": 30, "direct_interval": 10,
+                    "active_backoff_max": 60, "command_confirmation_timeout": 600}
         ranges = {"active_interval": (6, 60), "idle_interval": (10, 300),
                   "transaction_timeout": (1, 15), "connection_settle": (0, 1),
-                  "supplemental_interval": (10, 300)}
+                  "supplemental_interval": (10, 300), "direct_interval": (6, 300),
+                  "active_backoff_max": (10, 300), "command_confirmation_timeout": (60, 1800)}
         schema = {}
         for key, default in defaults.items():
             numeric = float if key == "connection_settle" else int
@@ -155,4 +157,6 @@ class FourHeatOptionsFlow(config_entries.OptionsFlow):
                 vol.Coerce(numeric), vol.Range(min=ranges[key][0], max=ranges[key][1]))
         schema[vol.Optional("supplemental_telemetry", default=self._entry.options.get(
             "supplemental_telemetry", False))] = bool
+        schema[vol.Optional("direct_telemetry", default=self._entry.options.get(
+            "direct_telemetry", False))] = bool
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

@@ -139,10 +139,8 @@ class FourHeatDevice(CoordinatorEntity):
             if self.type == MODE_TYPE or self.type == ERROR_TYPE or self.type == POWER_TYPE:
                 val[ATTR_NUM_VAL] = self.coordinator.data[self.type][0]
                 
-            if self.type == MODE_TYPE:
-                last = self.coordinator.last_successful_update
-                val["last_successful_communication"] = last.isoformat() if last else None
-                val["poll_interval_seconds"] = self.coordinator.update_interval.total_seconds()
+            if self.type in (MODE_TYPE, ERROR_TYPE, "30017"):
+                val.update(self.coordinator.communication_attributes)
             return val
 
         except Exception as ex:

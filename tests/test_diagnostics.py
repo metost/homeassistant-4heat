@@ -1,4 +1,5 @@
 """Verified supplemental packets, typed decoding and optional failure isolation."""
+import asyncio
 import importlib.util
 from pathlib import Path
 import types
@@ -67,16 +68,19 @@ class SupplementalTests(unittest.IsolatedAsyncioTestCase):
             return status()
         c.transport.request = request
         c.data = await c._async_update_data()
+        await c._supplemental_task
         self.assertEqual(c.supplemental_data['30011']['value'],9)
         await c._async_update_data()
         self.assertEqual(calls.count(SUPPLEMENTAL_QUERY),1)
         fail=True; c._supplemental_attempt=float('-inf')
         snapshot=await c._async_update_data()
+        await c._supplemental_task
         self.assertEqual(snapshot['30017'][0],65)
         self.assertEqual(c.supplemental_data,{})
         self.assertIsNone(c.supplemental_updated_at)
         fail=False; c._supplemental_attempt=float('-inf')
         await c._async_update_data()
+        await c._supplemental_task
         self.assertIsNotNone(c.supplemental_updated_at)
 
     async def test_default_profile_off_and_primary_failure_still_fails(self):
@@ -111,3 +115,55 @@ class SupplementalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(actual.native_value)
         c.last_update_success=False
         self.assertFalse(auger.available)
+
+    async def test_slow_diagnostics_do_not_delay_core_publication_and_unload_cancels(self):
+        c = self.create()
+        entered = asyncio.Event()
+        never = asyncio.Event()
+        async def request(payload):
+            if payload == SUPPLEMENTAL_QUERY:
+                entered.set()
+                await never.wait()
+            return status()
+        c.transport.request = request
+        c.data = await asyncio.wait_for(c._async_update_data(), .2)
+        self.assertEqual(c.data['30017'][0], 65)
+        await asyncio.wait_for(entered.wait(), .2)
+        task = c._supplemental_task
+        self.assertFalse(task.done())
+        await c.async_shutdown()
+        self.assertTrue(task.cancelled())
+        self.assertTrue(c.shutdown_called)
+        self.assertIsNone(c._supplemental_task)
+        c._schedule_supplemental()
+        self.assertIsNone(c._supplemental_task)
+
+    async def test_background_result_notifies_without_overwriting_new_core_snapshot(self):
+        c = self.create()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def request(payload):
+            if payload == SUPPLEMENTAL_QUERY:
+                entered.set()
+                await release.wait()
+                return EXTRA
+            return status()
+        c.transport.request = request
+        c.data = await c._async_update_data()
+        await entered.wait()
+        c.data = {'30001': [6, 'J'], '30017': [69, 'J']}
+        release.set()
+        await c._supplemental_task
+        self.assertEqual(c.data['30017'][0], 69)
+        self.assertEqual(c.listener_updates, 1)
+        self.assertEqual(c.supplemental_data['30011']['value'], 9)
+
+    async def test_unload_before_background_task_starts_clears_reference(self):
+        c = self.create()
+        async def request(payload):
+            return status()
+        c.transport.request = request
+        c.data = await c._async_update_data()
+        task = c._supplemental_task
+        await c.async_shutdown()
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(c._supplemental_task)

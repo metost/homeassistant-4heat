@@ -27,3 +27,11 @@ BETA * BETA * BETA - Not finished yet - BETA * BETA * BETA
 - [x] Add Icons
 
 
+
+### Local transport beta
+
+The `improve-local-transport` branch adds bounded asynchronous communication,
+optional direct state/error/water reads, background stove diagnostics and
+observed command-result tracking while keeping existing entity identities.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for options, protocol limits, validation and
+rollout/rollback instructions.

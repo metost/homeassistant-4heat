@@ -5,6 +5,9 @@ import json
 import re
 
 MAX_RESPONSE_BYTES = 65536
+# Firmware 4.75 processes ordinary SEC queue indices 0..13. This cap applies
+# to outbound explicit requests, never cached SEL response lengths.
+MAX_SEC_ITEMS = 14
 REGISTER = re.compile(r"[A-Za-z][0-9]{17}\Z")
 
 
@@ -26,6 +29,7 @@ def validate_response(message):
 
 def decode_registers(message):
     """Preserve the existing integer values and [value, marker] shape."""
+    validate_response(message)
     if message[0] not in ("SEL", "SEC"):
         raise ProtocolError("Status request rejected")
     data = {}
@@ -41,6 +45,20 @@ def decode_registers(message):
     return data
 
 
+def validate_request(payload):
+    """Reject oversized SEC batches before opening a socket; never split writes."""
+    try:
+        message = json.loads(payload)
+    except (ValueError, UnicodeError, TypeError) as err:
+        raise ProtocolError("Malformed request JSON") from err
+    validate_response(message)
+    if message[0] == "SEL" and message[1] == "0":
+        return message
+    if message[0] != "SEC" or not 1 <= len(message) - 2 <= MAX_SEC_ITEMS:
+        raise ProtocolError(f"SEC requests require 1..{MAX_SEC_ITEMS} items")
+    return message
+
+
 class FourHeatTransport:
     def __init__(self, host, port=80, *, timeout=5, settle=0.5):
         self.host, self.port = host, port
@@ -48,9 +66,38 @@ class FourHeatTransport:
         self._lock = asyncio.Lock()
 
     async def request(self, payload):
+        validate_request(payload)
         # Cancellation while queued never releases another transaction's lock.
         async with self._lock:
             return await asyncio.wait_for(self._exchange(payload), self.timeout)
+
+    async def read_registers(self, commands):
+        """Split only explicit A/I reads, validating the complete collection first.
+
+        Each chunk owns one normal transaction. No writes or retries can be
+        introduced here, and partial collections are never returned on failure.
+        """
+        commands = list(commands)
+        if not commands or any(not isinstance(item, str) or
+                not REGISTER.fullmatch(item) or item[0] not in ("A", "I") or
+                item[6:] != "000000000000" for item in commands):
+            raise ProtocolError("Expected zero-valued A/I register reads")
+        if len({item[1:6] for item in commands}) != len(commands):
+            raise ProtocolError("Duplicate read register")
+        result = {}
+        for start in range(0, len(commands), MAX_SEC_ITEMS):
+            chunk = commands[start:start + MAX_SEC_ITEMS]
+            payload = json.dumps(["SEC", str(len(chunk)), *chunk],
+                                 separators=(",", ":")).encode()
+            response = validate_response(await self.request(payload))
+            values = decode_registers(response)
+            expected = {item[1:6]: {"A": "B", "I": "J"}[item[0]] for item in chunk}
+            if (response[0] != "SEC" or len(response) - 2 != len(chunk) or
+                    set(values) != set(expected) or any(
+                    values[key][1] != marker for key, marker in expected.items())):
+                raise ProtocolError("Explicit read response does not match request")
+            result.update(values)
+        return result
 
     async def _exchange(self, payload):
         writer = None
