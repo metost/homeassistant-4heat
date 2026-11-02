@@ -2,7 +2,11 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
+from datetime import datetime, timezone
+
+_LOGGER = logging.getLogger(__name__)
 
 MAX_RESPONSE_BYTES = 65536
 # Firmware 4.75 processes ordinary SEC queue indices 0..13. This cap applies
@@ -60,22 +64,67 @@ def validate_request(payload):
 
 
 class FourHeatTransport:
-    def __init__(self, host, port=80, *, timeout=5, settle=0.5):
+    def __init__(self, host, port=80, *, timeout=5, settle=0.5,
+                 transaction_gap=1, read_retry_delay=1):
         self.host, self.port = host, port
         self.timeout, self.settle = timeout, settle
         self._lock = asyncio.Lock()
+        self.transaction_gap = transaction_gap
+        self.read_retry_delay = read_retry_delay
+        self._last_closed = float("-inf")
+        self.read_retries = 0
+        self.last_failure = None
+        self.last_failure_at = None
+        self._phase = "idle"
+        self._received_bytes = 0
 
     async def request(self, payload):
         validate_request(payload)
         # Cancellation while queued never releases another transaction's lock.
         async with self._lock:
-            return await asyncio.wait_for(self._exchange(payload), self.timeout)
+            loop = asyncio.get_running_loop()
+            gap = self.transaction_gap - (loop.time() - self._last_closed)
+            if gap > 0:
+                await asyncio.sleep(gap)
+            try:
+                return await asyncio.wait_for(self._exchange(payload), self.timeout)
+            except (OSError, asyncio.TimeoutError, ProtocolError) as err:
+                self.last_failure = (f"{type(err).__name__} during {self._phase} "
+                                     f"({self._received_bytes} response bytes): {err}").rstrip(": ")
+                self.last_failure_at = datetime.now(timezone.utc)
+                _LOGGER.debug("4heat transaction failed: %s", self.last_failure)
+                raise
+            finally:
+                self._last_closed = loop.time()
+
+    async def request_read(self, payload, *, decoder=None):
+        """At most two validated reads. Commands can never enter this path.
+
+        A failed attempt closes its socket before the retry delay. The delay
+        owns no transport lock, allowing queued commands to proceed first.
+        """
+        message = validate_request(payload)
+        if message[0] != "SEL" and any(
+                not REGISTER.fullmatch(item) or item[0] not in ("A", "I") or
+                item[6:] != "000000000000" for item in message[2:]):
+            raise ProtocolError("Read retry path cannot send writes")
+        for attempt in range(2):
+            try:
+                response = validate_response(await self.request(payload))
+                return decoder(response) if decoder else response
+            except (OSError, asyncio.TimeoutError, ProtocolError) as err:
+                if attempt:
+                    raise
+                _LOGGER.debug("Retrying read once after %s: %s", type(err).__name__, err)
+                await asyncio.sleep(self.read_retry_delay)
+                self.read_retries += 1
 
     async def read_registers(self, commands):
         """Split only explicit A/I reads, validating the complete collection first.
 
-        Each chunk owns one normal transaction. No writes or retries can be
-        introduced here, and partial collections are never returned on failure.
+        Each chunk uses the serialized transport. No writes can be
+        introduced here. Each chunk allows one read-only retry; partial
+        collections are never returned on failure.
         """
         commands = list(commands)
         if not commands or any(not isinstance(item, str) or
@@ -89,30 +138,39 @@ class FourHeatTransport:
             chunk = commands[start:start + MAX_SEC_ITEMS]
             payload = json.dumps(["SEC", str(len(chunk)), *chunk],
                                  separators=(",", ":")).encode()
-            response = validate_response(await self.request(payload))
-            values = decode_registers(response)
             expected = {item[1:6]: {"A": "B", "I": "J"}[item[0]] for item in chunk}
-            if (response[0] != "SEC" or len(response) - 2 != len(chunk) or
-                    set(values) != set(expected) or any(
-                    values[key][1] != marker for key, marker in expected.items())):
-                raise ProtocolError("Explicit read response does not match request")
-            result.update(values)
+
+            def decode_chunk(response):
+                values = decode_registers(response)
+                if (response[0] != "SEC" or len(response) - 2 != len(chunk) or
+                        set(values) != set(expected) or any(
+                        values[key][1] != marker for key, marker in expected.items())):
+                    raise ProtocolError("Explicit read response does not match request")
+                return values
+
+            result.update(await self.request_read(payload, decoder=decode_chunk))
         return result
 
     async def _exchange(self, payload):
         writer = None
         try:
+            self._phase = "connect"
+            self._received_bytes = 0
             reader, writer = await asyncio.open_connection(self.host, self.port)
             if self.settle:
+                self._phase = "connection settling"
                 await asyncio.sleep(self.settle)
+            self._phase = "send"
             writer.write(payload)
             await writer.drain()
             buffer = bytearray()
+            self._phase = "receive"
             while len(buffer) < MAX_RESPONSE_BYTES:
                 chunk = await reader.read(min(4096, MAX_RESPONSE_BYTES-len(buffer)))
                 if not chunk:
                     raise ProtocolError("Connection closed before complete response")
                 buffer.extend(chunk)
+                self._received_bytes = len(buffer)
                 try:
                     message = json.loads(buffer.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):

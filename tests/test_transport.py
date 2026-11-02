@@ -40,7 +40,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         server = await asyncio.start_server(tracked, "127.0.0.1", 0)
         self.servers.append(server)
         return transport.FourHeatTransport("127.0.0.1", server.sockets[0].getsockname()[1],
-                                           settle=0, timeout=timeout)
+                                           settle=0, timeout=timeout, transaction_gap=0, read_retry_delay=0)
 
     async def test_fragmented_response(self):
         async def handler(r, w):
@@ -130,7 +130,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 17)
 
     async def test_outbound_limit_rejects_writes_without_sending(self):
-        c = transport.FourHeatTransport('unused')
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
         sent = []
         async def exchange(payload):
             sent.append(payload)
@@ -148,7 +148,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         transport.validate_response(packet)
 
     async def test_large_read_collection_splits_at_14_without_writes(self):
-        c = transport.FourHeatTransport('unused')
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
         chunks = []
         async def request(payload):
             message = transport.validate_request(payload)
@@ -167,8 +167,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 await c.read_registers(bad)
         self.assertEqual(chunks, [])
 
-    async def test_explicit_read_rejects_wrong_fields_and_never_retries(self):
-        c = transport.FourHeatTransport('unused')
+    async def test_explicit_read_rejects_wrong_fields_with_bounded_retry(self):
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
         for response in [['SEL', '1', 'J30001000000000005'],
                          ['SEC', '1', 'J30002000000000000'],
                          ['SEC', '1', 'B30001000000000005'], ['SEC', '0']]:
@@ -179,10 +179,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             c.request = request
             with self.assertRaises(transport.ProtocolError):
                 await c.read_registers(['I30001000000000000'])
-            self.assertEqual(len(sent), 1)
+            self.assertEqual(len(sent), 2)
 
     async def test_cancelled_waiter_does_not_release_owners_lock(self):
-        c = transport.FourHeatTransport('unused')
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
         entered, release = asyncio.Event(), asyncio.Event()
         async def exchange(payload):
             entered.set()
@@ -202,24 +202,95 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(c._lock.locked())
 
     async def test_later_read_chunk_failure_returns_no_partial_result_or_retry(self):
-        c = transport.FourHeatTransport('unused')
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
         calls = []
         async def request(payload):
             message = transport.validate_request(payload)
             calls.append(message)
-            if len(calls) == 2:
+            if message[2][1:6] == '30014':
                 raise asyncio.TimeoutError()
             return ['SEC', message[1], *('J' + item[1:] for item in message[2:])]
         c.request = request
         commands = [f'I{30000 + i:05d}000000000000' for i in range(40)]
         with self.assertRaises(asyncio.TimeoutError):
             await c.read_registers(commands)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
 
     async def test_explicit_response_with_extra_duplicate_is_rejected(self):
-        c = transport.FourHeatTransport('unused')
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
         async def request(payload):
             return ['SEC', '2', REPLY[2], REPLY[2]]
         c.request = request
         with self.assertRaises(transport.ProtocolError):
             await c.read_registers(['I30001000000000000'])
+
+    async def test_read_retry_recovers_from_timeout_without_retrying_writes(self):
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
+        calls = []
+        async def request(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise asyncio.TimeoutError()
+            return REPLY
+        c.request = request
+        self.assertEqual(await c.request_read(READ), REPLY)
+        self.assertEqual(calls, [READ, READ])
+        self.assertEqual(c.read_retries, 1)
+        calls.clear()
+        for write in [WRITE, b'["SEC","1","B20180000000000000"]', b'["SEC","1","0"]']:
+            with self.assertRaises(transport.ProtocolError):
+                await c.request_read(write)
+        self.assertEqual(calls, [])
+
+    async def test_malformed_read_is_validated_before_retry_success(self):
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
+        calls = []
+        async def request(payload):
+            calls.append(payload)
+            return ['SEL', '1', 'bad'] if len(calls) == 1 else REPLY
+        c.request = request
+        result = await c.request_read(READ, decoder=transport.decode_registers)
+        self.assertEqual(result['30017'], [65, 'J'])
+        self.assertEqual(len(calls), 2)
+
+    async def test_read_retry_stops_after_two_failures(self):
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=0)
+        calls = []
+        async def request(payload):
+            calls.append(payload)
+            raise OSError('disconnected')
+        c.request = request
+        with self.assertRaises(OSError):
+            await c.request_read(READ)
+        self.assertEqual(calls, [READ, READ])
+
+    async def test_commands_proceed_during_read_retry_delay_and_cancellation_stops_retry(self):
+        c = transport.FourHeatTransport('unused', transaction_gap=0, read_retry_delay=60)
+        entered = asyncio.Event()
+        calls = []
+        async def exchange(payload):
+            calls.append(payload)
+            if payload == READ:
+                entered.set()
+                raise OSError('lost read')
+            return ['SEC', '1', 'J30254000000000001']
+        c._exchange = exchange
+        read = asyncio.create_task(c.request_read(READ))
+        await entered.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(c._lock.locked())
+        await asyncio.wait_for(c.request(WRITE), .2)
+        read.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await read
+        self.assertEqual(calls, [READ, WRITE])
+
+    async def test_transaction_gap_spaces_successful_connections(self):
+        c = transport.FourHeatTransport('unused', transaction_gap=.03, read_retry_delay=0)
+        starts = []
+        async def exchange(payload):
+            starts.append(asyncio.get_running_loop().time())
+            return REPLY
+        c._exchange = exchange
+        await asyncio.gather(c.request(READ), c.request(WRITE), c.request(READ))
+        self.assertTrue(all(b-a >= .025 for a, b in zip(starts, starts[1:])))

@@ -30,7 +30,8 @@
           "direct_telemetry": "Read state, error and water temperature directly (opt in)",
           "direct_interval": "Minimum interval between direct reads (seconds)",
           "active_backoff_max": "Maximum retry interval while active (seconds)",
-          "command_confirmation_timeout": "Wait for observed command result (seconds)"
+          "command_confirmation_timeout": "Wait for observed command result (seconds)",
+          "transaction_gap": "Minimum wait between transactions (seconds)"
         }
       }
     }

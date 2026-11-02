@@ -59,8 +59,10 @@ def status(state=5, water=65):
 
 class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
     def create(self, mode=False):
-        return coordinator.FourHeatDataUpdateCoordinator(None, config={
+        c = coordinator.FourHeatDataUpdateCoordinator(None, config={
             'host':'test', 'mode':mode, 'monitored_conditions':status()[2:]}, options={}, id='existing-entry')
+        c.transport.read_retry_delay = 0
+        return c
 
     def reply(self, c, response):
         async def request(payload):
@@ -139,7 +141,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HAError):
                 await c._async_update_data()
             intervals.append(c.update_interval.total_seconds())
-        self.assertEqual(intervals, [60, 120, 240, 300, 300])
+        self.assertEqual(intervals, [10, 20, 40, 80, 160])
 
     async def test_configured_active_backoff_cap(self):
         c = self.create()
@@ -368,3 +370,31 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.last_command['status'], 'pending')
         c.data = await c._async_update_data()
         self.assertEqual(c.last_command['status'], 'confirmed')
+
+    async def test_transient_primary_timeout_recovers_before_unavailable(self):
+        c = self.create()
+        calls = []
+        async def request(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise asyncio.TimeoutError()
+            return status(water=64)
+        c.transport.request = request
+        data = await c._async_update_data()
+        self.assertEqual(data['30017'][0], 64)
+        self.assertEqual(c._failures, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(c.communication_attributes['read_retries_total'], 1)
+
+    async def test_malformed_primary_read_is_retried_without_publishing_bad_data(self):
+        c = self.create()
+        c.data = {'30001': [0, 'J'], '30017': [40, 'J']}
+        calls = []
+        async def request(payload):
+            calls.append(payload)
+            return ['SEL', '1', 'bad'] if len(calls) == 1 else status(5, 66)
+        c.transport.request = request
+        data = await c._async_update_data()
+        self.assertEqual(data['30017'][0], 66)
+        self.assertEqual(c.data['30017'][0], 40)
+        self.assertEqual(len(calls), 2)

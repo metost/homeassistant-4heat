@@ -23,10 +23,14 @@ async def async_setup_entry(hass, entry, async_add_entities):
     entities = []
     sensorIds = entry.data[CONF_MONITORED_CONDITIONS]
 
+    seen_ids = set()
     for sensorId in sensorIds:
         if len(sensorId) > 5:
             try:
                 sId = sensorId[1:6]
+                if sId in seen_ids:
+                    continue
+                seen_ids.add(sId)
                 entities.append(FourHeatDevice(coordinator, sId, entry.title))
             except:
                 _LOGGER.debug(f"Error adding {sensorId}")

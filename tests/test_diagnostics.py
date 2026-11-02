@@ -54,9 +54,11 @@ class DecoderTests(unittest.TestCase):
 
 class SupplementalTests(unittest.IsolatedAsyncioTestCase):
     def create(self, enabled=True):
-        return coordinator.FourHeatDataUpdateCoordinator(None, config={
+        c = coordinator.FourHeatDataUpdateCoordinator(None, config={
             'host':'test', 'monitored_conditions':status()[2:]},
             options={'supplemental_telemetry':enabled}, id='existing-entry')
+        c.transport.read_retry_delay = 0
+        return c
 
     async def test_opt_in_throttling_and_optional_failure_recovery(self):
         c = self.create(); calls=[]; fail=False
@@ -167,3 +169,22 @@ class SupplementalTests(unittest.IsolatedAsyncioTestCase):
         await c.async_shutdown()
         self.assertTrue(task.cancelled())
         self.assertIsNone(c._supplemental_task)
+
+    async def test_single_optional_timeout_recovers_without_unavailable_notification(self):
+        c = self.create()
+        attempts = 0
+        async def request(payload):
+            nonlocal attempts
+            if payload == SUPPLEMENTAL_QUERY:
+                attempts += 1
+                if attempts == 1:
+                    raise asyncio.TimeoutError()
+                return EXTRA
+            return status()
+        c.transport.request = request
+        c.data = await c._async_update_data()
+        await c._supplemental_task
+        self.assertEqual(attempts, 2)
+        self.assertEqual(c.listener_updates, 1)
+        self.assertEqual(c.supplemental_data['30011']['value'], 9)
+        self.assertIsNotNone(c.supplemental_updated_at)

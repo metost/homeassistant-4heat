@@ -60,7 +60,8 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         self.fresh_registers = set()
         self.transport = FourHeatTransport(self._host, TCP_PORT,
             timeout=options.get("transaction_timeout", 5),
-            settle=options.get("connection_settle", 0.5))
+            settle=options.get("connection_settle", 0.5),
+            transaction_gap=options.get("transaction_gap", 1))
         monitored = {s[1:6] for s in config.get(CONF_MONITORED_CONDITIONS, [])
                      if isinstance(s, str) and len(s) == 18}
         self._required = {MODE_TYPE} | (monitored & {ERROR_TYPE, "30017"})
@@ -79,6 +80,11 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
             "last_direct_read": (self.last_direct_update.isoformat()
                                  if self.last_direct_update else None),
             "last_command": dict(self.last_command) if self.last_command else None,
+            "read_retries_total": self.transport.read_retries,
+            "last_transport_failure": self.transport.last_failure,
+            "last_transport_failure_at": (self.transport.last_failure_at.isoformat()
+                                          if self.transport.last_failure_at else None),
+            "consecutive_poll_failures": self._failures,
         }
 
     async def _read_critical(self):
@@ -123,12 +129,21 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
             pending["record"].update(status="confirmed", confirmed_at=utcnow().isoformat())
             self._pending = None
 
+    def _validate_primary(self, response):
+        # ERR is a normal request for the existing explicit fallback. Malformed
+        # status snapshots, including missing critical values, may be read again.
+        if response[0] != "ERR":
+            snapshot = decode_registers(response)
+            if not self._required.issubset(snapshot):
+                raise ProtocolError("Required stove telemetry is missing")
+        return response
+
     async def _async_update_data(self):
         self._expire_pending()
         direct = None
         observed_command = None
         try:
-            response = validate_response(await self.transport.request(DATA_QUERY))
+            response = await self.transport.request_read(DATA_QUERY, decoder=self._validate_primary)
             if response[0] == "ERR":
                 direct, observed_command = await self._read_critical()
                 snapshot = dict(direct)
@@ -139,10 +154,12 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         except (OSError, asyncio.TimeoutError, ProtocolError) as err:
             self._failures += 1
             active = self._pending is not None or self._last_state not in (0, 8, 9)
-            base = self.active_interval if active else self.idle_interval
+            # Retry acquisition promptly even when the last observed state was
+            # OFF; a failed connection should not create a full idle-period gap.
+            base = self.active_interval
             cap = self.active_backoff_max if active else 300
             self.update_interval = timedelta(seconds=min(cap, base * 2 ** min(self._failures-1, 8)))
-            raise UpdateFailed(f"4heat communication failed: {err}") from err
+            raise UpdateFailed(f"4heat communication failed: {str(err) or type(err).__name__}") from err
 
         now = asyncio.get_running_loop().time()
         if direct is None and (self._pending or (self.direct_enabled and
@@ -188,8 +205,8 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         self._supplemental_attempt = asyncio.get_running_loop().time()
         try:
             try:
-                response = await self.transport.request(SUPPLEMENTAL_QUERY)
-                self.supplemental_data = decode_supplemental(response)
+                self.supplemental_data = await self.transport.request_read(
+                    SUPPLEMENTAL_QUERY, decoder=decode_supplemental)
             except (OSError, asyncio.TimeoutError, ProtocolError) as err:
                 self.supplemental_data = {}
                 self.supplemental_updated_at = None

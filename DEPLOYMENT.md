@@ -1,4 +1,4 @@
-# Local transport beta (0.7.0b3)
+# Local transport beta (0.7.0b4)
 
 This branch starts at original upstream commit
 `3b3382653ea1daaa203fe70d9e4a7e46910105b3`.
@@ -30,10 +30,11 @@ before enabling new heating policies.
 - Configure these under the integration's options; saving options reloads it.
 - Active/unknown-state failures back off from the active interval to the
   configured active maximum (default 10, 20, 40, 60 seconds). Known idle failures
-  retain the idle backoff, capped at 300 seconds. Pending commands use active
+  now start recovery at the active interval too, then back off to 300 seconds. Pending commands use active
   polling/backoff once a coordinator poll runs.
 - One async lock serializes all requests. Commands wait for an in-flight poll;
-  there is no command priority/preemption and no background retry worker.
+  there is no command preemption. Failed reads may retry once after a delay
+  that holds no lock; writes are never automatically repeated.
 - State, error and water sensors include communication/source timestamps and
   the last command result. Module-cache communication is explicitly distinguished
   from a direct board read. A partial explicit fallback may retain older
@@ -153,11 +154,48 @@ Explicit outbound SEC packets are capped at **14 items**, conservatively matchin
 the ordinary queue worker found in firmware 4.75. Oversized write packets fail
 before connecting. A read-only helper validates the entire A/I collection first,
 then splits it into chunks of at most 14, validates each response against the
-requested registers, and returns no partial collection on failure. It never
-splits or retries writes. This restriction does not cap the existing 18-value
+requested registers, and returns no partial collection on failure. Each read chunk may retry once;
+it never splits or retries writes. This restriction does not cap the existing 18-value
 cached SEL response. No boundary-size packet has been sent to the real stove.
 
 Validation remains simulated at the HA boundary. Full HA options/entity lifecycle
 checks and verification of actual command acknowledgment forms and observed
 transitions are still deployment prerequisites. No new live control test has
 been performed for beta 3.
+
+
+## Availability recovery (beta 4)
+
+Recorder analysis after beta 3 installation found 15 primary-poll failures between
+10:41 and 12:33 on 2 November 2026. Most left the main sensors and switches
+unavailable for approximately 60–69 seconds because the next OFF-state poll was
+60 seconds away. Optional diagnostics failed more often. Read-only probes also
+observed connection timeouts, empty responses and one valid reply taking 4.6
+seconds. These were probes alongside normal HA traffic, not an isolated network
+benchmark; they do not identify Wi-Fi or module firmware as the definitive cause.
+
+Beta 4 addresses the integration's response to these intermittent failures:
+
+- A failed read can retry once after a one-second delay. Both attempts require a
+  complete, valid response, including the decoder and required register checks.
+  Only SEL/0 and zero-valued A/I reads may use this path; B/J writes and legacy
+  control packets are rejected before any socket opens. Commands remain single-attempt.
+- A configurable `Minimum wait between transactions` defaults to one second
+  after socket closure. It spaces the cached, critical and optional requests
+  instead of opening them immediately back-to-back. Each transaction retains its
+  configured deadline; waiting for the lock/gap is separate.
+- If both main-read attempts fail, entities still become unavailable. Recovery
+  begins at the active interval even when the last known state was OFF (default
+  10, 20, 40, 80, 160, then 300 seconds). Active recovery retains its configured cap.
+- Optional data is cleared only after both read attempts fail. A recovered first
+  failure does not publish an intermediate unavailable diagnostic state. Expired
+  or failed data is not relabelled fresh; no stale-value grace period is added.
+- State/error/water attributes expose `read_retries_total`, `last_transport_failure`,
+  `last_transport_failure_at` and `consecutive_poll_failures`. Failure details
+  identify connection/send/receive phase and received-byte count.
+- Repeated monitored register 20211 is deduplicated during entity creation without
+  changing its existing name or unique ID.
+
+These changes require observation in HA to establish their real-world effect;
+they do not guarantee that underlying connection failures disappear. No increase
+to the transaction timeout, cloud polling or automatic command retry is included.
