@@ -67,9 +67,15 @@ class FourHeatDevice(CoordinatorEntity):
         return f"{self._name} {self._sensor}"
 
     @property
+    def available(self):
+        """A partial startup snapshot need not contain every legacy field."""
+        return (self.coordinator.last_update_success and
+                self.type in (self.coordinator.data or {}))
+
+    @property
     def state(self):
         """Return the state of the device."""
-        if self.type not in self.coordinator.data:
+        if self.type not in (self.coordinator.data or {}):
             return None  # Evita di inviare valori non validi
 
         try:
@@ -106,7 +112,8 @@ class FourHeatDevice(CoordinatorEntity):
     @property
     def maker(self):
         """Maker information"""
-        return self.coordinator.data[self.type][1]
+        reading = (self.coordinator.data or {}).get(self.type)
+        return reading[1] if reading else None
 
     @property
     def unit_of_measurement(self):
@@ -135,6 +142,8 @@ class FourHeatDevice(CoordinatorEntity):
 
     @property
     def extra_state_attributes(self):
+        if self.type not in (self.coordinator.data or {}):
+            return None
         try:
             val = {ATTR_MARKER: self.coordinator.data[self.type][1]}
             val[ATTR_READING_ID] = self.type
