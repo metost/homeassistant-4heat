@@ -56,6 +56,9 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         self.supplemental_updated_at = None
         self._supplemental_attempt = float("-inf")
         self._supplemental_task = None
+        self._cache_task = None
+        self._cache_attempt = float("-inf")
+        self.cache_updated_at = None
         self._shutting_down = False
         self.fresh_registers = set()
         self.transport = FourHeatTransport(self._host, TCP_PORT,
@@ -80,6 +83,7 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
             "last_direct_read": (self.last_direct_update.isoformat()
                                  if self.last_direct_update else None),
             "last_command": dict(self.last_command) if self.last_command else None,
+            "last_cached_read": self.cache_updated_at.isoformat() if self.cache_updated_at else None,
             "read_retries_total": self.transport.read_retries,
             "last_transport_failure": self.transport.last_failure,
             "last_transport_failure_at": (self.transport.last_failure_at.isoformat()
@@ -143,16 +147,27 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         direct = None
         observed_command = None
         try:
-            response = await self.transport.request_read(DATA_QUERY, decoder=self._validate_primary)
-            if response[0] == "ERR":
+            if self.direct_enabled or self._pending:
+                # The critical board read is the primary transaction. A cached
+                # SEL failure must not block it or replace its state with old data.
                 direct, observed_command = await self._read_critical()
                 snapshot = dict(direct)
+                partial = True
             else:
-                snapshot = decode_registers(response)
+                response = await self.transport.request_read(DATA_QUERY, decoder=self._validate_primary)
+                partial = response[0] in ("ERR", "SEC")
+                if response[0] == "ERR":
+                    direct, observed_command = await self._read_critical()
+                    snapshot = dict(direct)
+                else:
+                    snapshot = decode_registers(response)
+                    self.cache_updated_at = utcnow()
             if not self._required.issubset(snapshot):
                 raise ProtocolError("Required stove telemetry is missing")
         except (OSError, asyncio.TimeoutError, ProtocolError) as err:
             self._failures += 1
+            if self.direct_enabled or self._pending:
+                self.direct_read_status = "failed"
             active = self._pending is not None or self._last_state not in (0, 8, 9)
             # Retry acquisition promptly even when the last observed state was
             # OFF; a failed connection should not create a full idle-period gap.
@@ -161,23 +176,9 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
             self.update_interval = timedelta(seconds=min(cap, base * 2 ** min(self._failures-1, 8)))
             raise UpdateFailed(f"4heat communication failed: {str(err) or type(err).__name__}") from err
 
-        now = asyncio.get_running_loop().time()
-        if direct is None and (self._pending or (self.direct_enabled and
-                now - self._direct_attempt >= self.direct_interval)):
-            self._direct_attempt = now
-            try:
-                direct, observed_command = await self._read_critical()
-            except (OSError, asyncio.TimeoutError, ProtocolError) as err:
-                self.direct_read_status = "failed"
-                self._direct_snapshot = {}
-                _LOGGER.debug("Direct critical telemetry unavailable: %s", err)
         if direct is not None:
             self._record_direct(direct)
             self._confirm_pending(direct, observed_command)
-        # Keep the most recent explicit read between direct polls, avoiding a
-        # regression to an older module cache. Its timestamp never advances here.
-        if self._direct_snapshot and (self.direct_enabled or direct is not None):
-            snapshot.update(self._direct_snapshot)
             self.core_source = "direct_read"
         else:
             self.core_source = "module_cache"
@@ -185,11 +186,43 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         self.last_successful_update = utcnow()
         self._last_state = snapshot[MODE_TYPE][0]
         idle = self._last_state in (0, 8, 9) and self._pending is None
-        self.update_interval = timedelta(seconds=self.idle_interval if idle else self.active_interval)
+        interval = self.idle_interval if idle else self.active_interval
+        if self.direct_enabled:
+            interval = max(interval, self.direct_interval)
+        self.update_interval = timedelta(seconds=interval)
         self.fresh_registers = set(snapshot)
+        if self.direct_enabled and self.cache_updated_at and (utcnow() - self.cache_updated_at).total_seconds() <= 120:
+            self.fresh_registers.update(key for key in (self.data or {}) if key not in CRITICAL_IDS)
+        if self.direct_enabled:
+            self._schedule_cache()
         self._schedule_supplemental()
-        # Explicit fallback is partial; retain noncritical entity values.
-        return {**(self.data or {}), **snapshot} if response[0] in ("ERR", "SEC") else snapshot
+        # Only noncritical values may survive between direct primary samples.
+        return {**(self.data or {}), **snapshot} if partial else snapshot
+
+    def _schedule_cache(self):
+        if (not self._shutting_down and self._cache_task is None and
+                asyncio.get_running_loop().time() - self._cache_attempt >= 60):
+            self._cache_attempt = asyncio.get_running_loop().time()
+            self._cache_task = asyncio.create_task(self._async_read_cache())
+
+    async def _async_read_cache(self):
+        """Refresh legacy noncritical fields without changing critical state."""
+        try:
+            await asyncio.sleep(2)
+            if self.transport.busy:
+                return
+            readings = await self.transport.request_read(DATA_QUERY, decoder=decode_registers)
+            noncritical = {key: value for key, value in readings.items() if key not in CRITICAL_IDS}
+            # Merge against the current snapshot, not the one that existed when
+            # this delayed read started. Never overwrite fresh core telemetry.
+            self.data = {**(self.data or {}), **noncritical}
+            self.cache_updated_at = utcnow()
+            self.fresh_registers.update(noncritical)
+            self.async_update_listeners()
+        except (OSError, asyncio.TimeoutError, ProtocolError) as err:
+            _LOGGER.debug("Noncritical cached telemetry unavailable: %s", err)
+        finally:
+            self._cache_task = None
 
     def _schedule_supplemental(self):
         if (self.supplemental_enabled and not self._shutting_down and
@@ -204,6 +237,10 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
         """Optional failures never hold up publication of required telemetry."""
         self._supplemental_attempt = asyncio.get_running_loop().time()
         try:
+            if self.direct_enabled:
+                await asyncio.sleep(4)
+                if self.transport.busy:
+                    return
             try:
                 self.supplemental_data = await self.transport.request_read(
                     SUPPLEMENTAL_QUERY, decoder=decode_supplemental)
@@ -219,10 +256,12 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_shutdown(self):
         self._shutting_down = True
-        task, self._supplemental_task = self._supplemental_task, None
-        if task is not None:
+        tasks = [task for task in (self._supplemental_task, self._cache_task) if task is not None]
+        self._supplemental_task = self._cache_task = None
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await super().async_shutdown()
 
     async def _command(self, payload, action, *, register=None, value=None):
@@ -244,13 +283,16 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
             self._pending = pending
             try:
                 response = validate_response(await self.transport.request(payload))
-                # A generic SEC envelope is insufficient: require the one-item
-                # echo of the actual submitted command, including its value.
-                if response != json.loads(payload):
-                    if response[0] == "ERR":
-                        record.update(status="rejected", acknowledgment="rejected")
-                        self._pending = None
-                    raise ProtocolError("Command acknowledgment does not match request")
+                record["protocol_response"] = list(response)
+                if response[0] == "ERR":
+                    record.update(status="rejected", acknowledgment="rejected")
+                    self._pending = None
+                    raise ProtocolError("Module rejected the command")
+                if response[0] != "SEC":
+                    raise ProtocolError("Unexpected command response type")
+                # The app accepts a valid SEC receipt without requiring an echo.
+                # Receipt is never evidence that the stove changed phase.
+                echoed = response == json.loads(payload)
             except (OSError, asyncio.TimeoutError, ProtocolError) as err:
                 record["error"] = str(err)
                 raise HomeAssistantError(
@@ -258,7 +300,7 @@ class FourHeatDataUpdateCoordinator(DataUpdateCoordinator):
                 ) from err
             else:
                 self.last_command_accepted = utcnow()
-                record.update(acknowledgment="accepted",
+                record.update(acknowledgment="accepted" if echoed else "received_unverified",
                               acknowledged_at=self.last_command_accepted.isoformat())
             finally:
                 # Reads already in flight or started before this transaction

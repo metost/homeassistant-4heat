@@ -1,201 +1,118 @@
-# Local transport beta (0.7.0b4)
+# Local transport beta (0.7.0b5)
 
-This branch starts at original upstream commit
-`3b3382653ea1daaa203fe70d9e4a7e46910105b3`.
+This branch starts at upstream commit `3b3382653ea1daaa203fe70d9e4a7e46910105b3`.
 
-## Compatibility contract
+## Compatibility
 
-Keep the existing integration entry. Do not remove/re-add it, rename its title,
-change its domain, delete registry entries, or replace configuration YAML.
-The integration directory/domain remains `4heat`. Config flow version remains 1.
-Existing sensor and switch names, unique-ID formulas, device identifiers,
-state labels, register mapping and `4heat.set_value` action remain unchanged.
-No Tado configuration or heating policy is part of this change.
+Retain the existing integration entry, title, domain `4heat`, config flow version
+1, entity names, unique IDs, device identifiers, state labels, register mapping
+and `4heat.set_value` action. Do not remove/re-add the entry or replace heating
+configuration. No Tado configuration or heating policy changes are included.
 
-Commands are no longer silently successful after network errors. Failures raise
-an action error and ambiguous commands are never automatically repeated.
-Only a one-item SEC echo matching the submitted command is recorded as an
-acknowledgment. Other responses are rejected or unconfirmed; a successful
-acknowledgment still does not prove that the requested action has completed.
-Actual operating state comes from telemetry, not an optimistic switch update.
-Failed polls mark coordinator entities unavailable instead of claiming stale
-data is fresh. These intentional behavior changes should be observed in HA
-before enabling new heating policies.
+## Authoritative telemetry (beta 5)
 
-## Communication
+Beta 4 could report a frozen module cache after a command's first direct read
+confirmed ignition. Its optional direct read also depended on a successful cached
+poll, and failures could substitute old cached critical readings. Beta 5 removes
+that dependency when direct telemetry is enabled:
 
-- Defaults: 10 seconds active (including ignition, extinguishing and standby),
-  60 seconds OFF/Safety/Block, 5-second transaction deadline, 0.5-second
-  connection settling.
-- Configure these under the integration's options; saving options reloads it.
-- Active/unknown-state failures back off from the active interval to the
-  configured active maximum (default 10, 20, 40, 60 seconds). Known idle failures
-  now start recovery at the active interval too, then back off to 300 seconds. Pending commands use active
-  polling/backoff once a coordinator poll runs.
-- One async lock serializes all requests. Commands wait for an in-flight poll;
-  there is no command preemption. Failed reads may retry once after a delay
-  that holds no lock; writes are never automatically repeated.
-- State, error and water sensors include communication/source timestamps and
-  the last command result. Module-cache communication is explicitly distinguished
-  from a direct board read. A partial explicit fallback may retain older
-  noncritical registers.
-- Integer-register interpretation is retained. Wider signed/scaled protocol
-  formats and model-specific parameters are deliberately not introduced here.
-- No write ranges are inferred for arbitrary model-specific registers. The
-  service validates integer shape, not whether a value is safe for a stove.
+- Every primary poll directly requests board status, error and water temperature.
+  It publishes only a complete, validated response to that request. A failed
+  direct read cannot fall back to SEL cache or a previous direct snapshot.
+- An independent background SEL read refreshes legacy noncritical fields at most
+  once per minute. Its status, error and water values are discarded. It merges
+  against the latest coordinator data, so a delayed cache response cannot undo a
+  newer board observation. Cache failure never invalidates successful core data.
+- Extra reads wait briefly after core publication and skip starting while the
+  transport is busy. All transactions share one lock; an already-running optional
+  transaction cannot be preempted and can delay the next primary request.
+- Direct telemetry remains an explicit model-support option. Enable it for this
+  installation. If disabled, normal SEL polling remains available for legacy
+  devices, and cannot guarantee physical freshness. Pending commands still force
+  direct observations; periodic direct reads continue after confirmation when
+  the option is enabled.
 
-## Validation completed locally
+`critical_data_source` identifies `direct_read` versus `module_cache`.
+`last_direct_read` advances only after a successful board request;
+`last_cached_read` describes the independent cache transaction. These timestamps
+are acquisition times, not measurement timestamps supplied by physical probes.
+Unchanged values with advancing direct timestamps mean successful repeated
+observations; an old direct timestamp must never be treated as fresh.
 
-Run `python3 -m unittest discover -s tests -v` and
-`python3 -m compileall -q custom_components tests`.
-Transport tests use actual localhost TCP streams, including fragmentation,
-cancellation, disconnection, timeouts and read/write serialization.
-Coordinator tests stub the HA boundary; they are not a full HA runtime test.
-Compatibility tests freeze upstream identity expressions and state mappings.
-The status fixture retains a real packet's structure with synthetic values.
-One real read-only SEL/0 query passed through the new transport. No live control
-commands have been sent. Full HA reload/UI tests and live command tests are
-still required before treating this beta as production validated.
+## Timing and failures
 
-## Deployment procedure (not yet performed)
+Defaults are 10 seconds active (including ignition, extinguishing and standby),
+60 seconds OFF/Safety/Block, 5-second transaction deadline, 0.5-second connection
+settling, and one second between transactions. The current deployment is tuned
+to a seven-second deadline. Saving integration options reloads the entry.
+The direct-read minimum interval can lengthen the primary interval. Intervals
+and backoff are scheduling targets; network latency and shared transactions add
+time. A short phase occurring entirely between observations may be missed.
 
-1. Back up the current custom_components/4heat directory, current integration
-   config entry and entity/device registry snapshots privately. Record all
-   existing 4heat entity IDs, unique IDs and device IDs for comparison.
-2. Arrange a suitable maintenance window. Copy only the candidate integration
-   directory into /config/custom_components/4heat; retain the existing entry.
-   Remove stale Python bytecode from that directory if needed.
-3. Restart HA to ensure the new Python modules are loaded. Check logs and compare
-   the entity/device inventory with the pre-deploy snapshot. No duplicate or
-   suffixed entities should appear. Check the set_value service's existing
-   register attributes and the options UI.
-4. Observe successful communication and polling intervals, including availability
-   during a network fault. Verify a real control action only when appropriate
-   for the stove; distinguish command acceptance from phase transitions.
-5. If needed, restore the saved integration directory and restart HA. Retain
-   the original entry/registries. Do not reset the integration to roll back.
+Only zero-valued A/I reads and SEL/0 can retry once, after one second outside the
+transport lock. Writes are single-attempt and never automatically repeated.
+If both primary attempts fail, coordinator entities become unavailable. Recovery
+starts at the active interval even after OFF, doubling up to 300 seconds when
+idle or the configured active cap (default 60 seconds) when active/unknown.
 
-No HA files, room targets or automations were modified while developing this beta.
+Attributes include retry count, last transport failure/time and consecutive poll
+failures. Failure details identify connection/send/receive phase and byte count.
+Malformed or incomplete replies are not successful updates. Explicit SEC packets
+are limited to 14 items; larger read collections split into validated chunks.
+Writes are never split or retried. Existing longer cached SEL replies are allowed.
 
+## Command receipts and observed results
 
-## Optional SYEVO0000513 diagnostics (beta 2)
+The official app accepts valid SEC receipts without requiring an exact echo.
+Beta 4's strict echo check rejected some legitimate receipts. Beta 5 records
+matching echoes as `accepted`, and other valid SEC receipts as
+`received_unverified`, retaining `protocol_response` for diagnosis. ERR is rejected;
+network/protocol failures raise an action error and keep observing a possibly
+transmitted command. No receipt fabricates an operating state.
 
-Only enable `Read additional diagnostics (SYEVO0000513 only)` for product
-SYEVO0000513 version 1. This is an explicit model profile, not automatic discovery.
-It is OFF by default and saving options reloads the integration. Existing entities
-retain their names and unique IDs. Four new diagnostic entities distinguish
-selected pellet power (Auto = maximum manual setting + 1), actual power/status,
-auger reading and combustion fan reading.
+`last_command` records action, receipt, pending/confirmed/unconfirmed status and
+timestamps. Only a later direct read can confirm an observable result. ON means
+a starting/running phase was observed, not necessarily normal Run. OFF remains
+pending until OFF is observed. Unblock needs a cleared error and a state other
+than Block. Set-value reads back and compares the requested register. A matching
+value is an observation, not proof of causation. Pending identical calls coalesce;
+different actions supersede tracking. Tracking expires after 600 seconds by
+default, without resending. Unknown technical parameter addresses and safe write
+ranges are not inferred.
 
-One read-only SEC packet with three I-prefixed registers is sent at most every
-30 seconds by default, scheduled after successful normal coordinator polls. With 10-second active
-polling this adds up to two local requests per minute. The actual interval can be
-longer when the main poll interval or failure backoff is longer. The task runs in the background, not inside the main update awaited by HA.
-It notifies diagnostic entities without replacing the main snapshot, and is
-cancelled on unload. An already-running transaction still holds the shared TCP
-lock until completion/timeout; it cannot be preempted. No new cloud requests or
-write actions are introduced. A failed extra query makes these extra
-readings unavailable, while successful normal state/water telemetry stays usable.
+## Optional SYEVO0000513/1 diagnostics
 
-Actual power 9 is P Mod on this profile. The auger reading uses the app's base
-signed type-5 /100 decoder and retains its raw register attribute. Its physical
-unit is deliberately unset: no fuel consumption, kW, duty percent or duration is
-inferred, and the map's additional multiplier is not applied without validation.
-The fan reading is also unitless pending validation. These are diagnostic values,
-not confirmed energy/performance measurements.
+Enable the model-specific diagnostics only for that confirmed profile. Existing
+entity identities remain unchanged; selected pellet power, actual combustion
+power, auger and combustion fan are four additional entities. Selected power is
+Auto when it equals the maximum manual setting plus one. Actual power 9 is P Mod.
+The auger uses the app's base signed type-5 /100 decoder and retains its raw
+register; its physical unit and the fan's physical unit remain unverified. These
+are diagnostic readings, not measured kW or fuel consumption.
 
-Local read-only validation returned values for all three registers. The code has
-not been deployed to HA, and its options/entities still need an HA runtime check.
+A separate three-register read is scheduled at most every 30 seconds by default,
+following successful core polls; actual cadence can be longer. Optional errors
+clear these readings without invalidating core observations. Tasks are cancelled
+on unload. The extra data cannot overwrite the primary snapshot.
 
+## Verification and installation
 
-## Firmware-informed reads and command tracking (beta 3)
+Run `python3 -m unittest discover -s tests -v`,
+`python3 -m compileall -q custom_components tests` and `git diff --check`.
+Transport tests use localhost TCP streams for fragmentation, cancellation,
+timeouts, reconnect and serialization. Coordinator tests stub the HA boundary.
+Regression tests keep SEL frozen while direct status progresses through ignition,
+stabilization, Run, modulation, extinguishing and OFF; ensure reads continue
+following command confirmation; ensure delayed cache responses cannot regress
+critical data; and ensure direct failure cannot publish cached critical values.
+Identity tests preserve upstream registry formulas and mappings. These tests do
+not replace validation in a running HA instance or a normal physical burn cycle.
 
-The firmware 4.75 analysis supports retaining the normal cached `SEL/0` poll and
-using small explicit `SEC` reads. New options are available under Local
-communication; existing entry data and identities do not need migration:
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| Read state, error and water temperature directly | Off | Opt in to a separate three-register board request; validate support on the installed model. |
-| Minimum interval between direct reads | 10 seconds | Minimum spacing; actual cadence follows main polling and backoff. |
-| Maximum retry interval while active | 60 seconds | Cap, never below the configured active interval. |
-| Wait for observed command result | 600 seconds | Stop tracking an unconfirmed result after this window; never resend it automatically. |
-
-`critical_data_source` is `module_cache` or `direct_read`. The latter can reuse
-the last direct values between direct polls so an older SEL cache cannot
-immediately overwrite them. `last_direct_read` advances only after a successful
-explicit read, while `last_successful_communication` can advance on a cached
-response. These are transaction timestamps, not timestamps supplied by physical
-probes. For freshness-dependent automations, compare the timestamp to the current
-time as well as checking availability, source and `direct_read_status`. A failed
-direct read falls back to labelled cached values; it never advances the direct
-timestamp. Required main-poll failures still make entities unavailable.
-
-Commands expose `last_command` on the state switch and state/error/water sensors:
-`action`, `requested_at`, `acknowledgment`, `status`, and confirmation timestamps.
-Only a subsequent explicit board read can confirm the observable result. ON is
-confirmed when a starting/running phase is observed, not when normal Run is
-necessarily reached. OFF remains pending through ignition, Block or
-extinguishing until state OFF is observed. Unblock needs a cleared error and a
-state other than Block. A set-value command reads back its specific register and
-compares the integer value. Pending commands request these direct reads even
-when periodic direct telemetry is disabled.
-
-A matching acknowledgment records receipt, not causal proof that a command
-produced a transition. A missing/unrecognized acknowledgment raises an action
-error but keeps observing a possibly transmitted command. Unknown acknowledgment
-forms are deliberately unconfirmed pending live validation. Repeated identical
-calls while pending are coalesced; a later explicitly invoked command after the
-window expires may send again. Different requested actions supersede tracking of
-the previous action. There is no autonomous write retry, technical-parameter
-write discovery or change to existing switch state semantics.
-
-Explicit outbound SEC packets are capped at **14 items**, conservatively matching
-the ordinary queue worker found in firmware 4.75. Oversized write packets fail
-before connecting. A read-only helper validates the entire A/I collection first,
-then splits it into chunks of at most 14, validates each response against the
-requested registers, and returns no partial collection on failure. Each read chunk may retry once;
-it never splits or retries writes. This restriction does not cap the existing 18-value
-cached SEL response. No boundary-size packet has been sent to the real stove.
-
-Validation remains simulated at the HA boundary. Full HA options/entity lifecycle
-checks and verification of actual command acknowledgment forms and observed
-transitions are still deployment prerequisites. No new live control test has
-been performed for beta 3.
-
-
-## Availability recovery (beta 4)
-
-Recorder analysis after beta 3 installation found 15 primary-poll failures between
-10:41 and 12:33 on 2 November 2026. Most left the main sensors and switches
-unavailable for approximately 60–69 seconds because the next OFF-state poll was
-60 seconds away. Optional diagnostics failed more often. Read-only probes also
-observed connection timeouts, empty responses and one valid reply taking 4.6
-seconds. These were probes alongside normal HA traffic, not an isolated network
-benchmark; they do not identify Wi-Fi or module firmware as the definitive cause.
-
-Beta 4 addresses the integration's response to these intermittent failures:
-
-- A failed read can retry once after a one-second delay. Both attempts require a
-  complete, valid response, including the decoder and required register checks.
-  Only SEL/0 and zero-valued A/I reads may use this path; B/J writes and legacy
-  control packets are rejected before any socket opens. Commands remain single-attempt.
-- A configurable `Minimum wait between transactions` defaults to one second
-  after socket closure. It spaces the cached, critical and optional requests
-  instead of opening them immediately back-to-back. Each transaction retains its
-  configured deadline; waiting for the lock/gap is separate.
-- If both main-read attempts fail, entities still become unavailable. Recovery
-  begins at the active interval even when the last known state was OFF (default
-  10, 20, 40, 80, 160, then 300 seconds). Active recovery retains its configured cap.
-- Optional data is cleared only after both read attempts fail. A recovered first
-  failure does not publish an intermediate unavailable diagnostic state. Expired
-  or failed data is not relabelled fresh; no stale-value grace period is added.
-- State/error/water attributes expose `read_retries_total`, `last_transport_failure`,
-  `last_transport_failure_at` and `consecutive_poll_failures`. Failure details
-  identify connection/send/receive phase and received-byte count.
-- Repeated monitored register 20211 is deduplicated during entity creation without
-  changing its existing name or unique ID.
-
-These changes require observation in HA to establish their real-world effect;
-they do not guarantee that underlying connection failures disappear. No increase
-to the transaction timeout, cloud polling or automatic command retry is included.
+Before deployment, privately back up configuration, integration code, options and
+entity/device inventory. Replace only `custom_components/4heat`, retaining the
+entry and registries, and restart HA. Enable both confirmed direct/model options.
+Check the installed version, original entity identities, source/timestamp
+progression and agreement with direct read-only observations. Verify operating
+transitions during normal use; do not ignite, extinguish or reset the stove just
+for a software smoke test. Roll back by restoring the saved integration directory
+and restarting HA, retaining the same entry.

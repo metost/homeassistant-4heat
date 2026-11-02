@@ -152,42 +152,28 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await c._async_update_data()
         self.assertEqual(c.update_interval.total_seconds(), 20)
 
-    async def test_direct_telemetry_throttles_and_cache_is_not_called_fresh(self):
+    async def test_direct_primary_never_falls_back_to_stale_cache(self):
         c = self.create()
         c.direct_enabled = True
-        c.direct_interval = 30
-        calls = []
+        c._schedule_cache = lambda: None
         fail = False
+        calls = []
         async def request(payload):
             calls.append(payload)
             if payload == coordinator.DATA_QUERY:
-                return status(water=60)
+                raise AssertionError("Cached status must not be the primary read")
             if fail:
-                raise OSError('board read unavailable')
+                raise OSError('board unavailable')
             return ['SEC', '3', *status(6, 67)[2:]]
         c.transport.request = request
         c.data = await c._async_update_data()
-        last = c.last_direct_update
-        self.assertEqual(c.data['30017'][0], 67)
-        self.assertEqual(c.core_source, 'direct_read')
-        self.assertEqual(c.direct_read_status, 'ok')
-        c.data = await c._async_update_data()
-        self.assertEqual(c.data['30017'][0], 67)
-        self.assertEqual(len(calls), 3)  # SEL+SEC, then only SEL.
-        self.assertEqual(c.last_direct_update, last)
+        last = c.last_successful_update
         fail = True
-        c._direct_attempt = float('-inf')
-        c.data = await c._async_update_data()
-        self.assertEqual(c.data['30017'][0], 60)
-        self.assertEqual(c.core_source, 'module_cache')
+        with self.assertRaises(HAError):
+            await c._async_update_data()
+        self.assertEqual(c.last_successful_update, last)
         self.assertEqual(c.direct_read_status, 'failed')
-        self.assertEqual(c.last_direct_update, last)
-        self.assertIsNotNone(c.last_successful_update)
-        fail = False
-        c._direct_attempt = float('-inf')
-        c.data = await c._async_update_data()
-        self.assertEqual(c.data['30017'][0], 67)
-        self.assertEqual(c.direct_read_status, 'ok')
+        self.assertNotIn(coordinator.DATA_QUERY, calls)
 
     async def test_explicit_fallback_retains_noncritical_fields(self):
         c = self.create()
@@ -243,13 +229,12 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 return status(5)
             return ['SEC', '3', *status(0)[2:]]
         c.transport.request = request
-        with self.assertRaises(HAError):
-            await c.async_turn_off()
-        self.assertIsNone(c.last_command_accepted)
+        await c.async_turn_off()
+        self.assertEqual(c.last_command['acknowledgment'], 'received_unverified')
         await c.async_turn_off()
         c.data = await c._async_update_data()
         self.assertEqual(c.last_command['status'], 'confirmed')
-        self.assertEqual(c.last_command['acknowledgment'], 'unconfirmed')
+        self.assertEqual(c.last_command['acknowledgment'], 'received_unverified')
         self.assertEqual(len(writes), 1)
 
     async def test_pending_expires_without_retrying_or_fabricating_state(self):
@@ -290,16 +275,19 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         c.data = await c._async_update_data()
         self.assertEqual(c.last_command['status'], 'confirmed')
 
-    async def test_wrong_echo_and_rejection_never_count_as_acceptance(self):
-        for response in [['SEC', '1', 'J30253000000000001'], ['SEC', '1', 'OK'], ['ERR', '0']]:
+    async def test_generic_sec_receipt_is_not_physical_confirmation(self):
+        for response in [['SEC', '0'], ['SEC', '1', 'OK']]:
             c = self.create()
             self.reply(c, response)
-            with self.assertRaises(HAError):
-                await c.async_turn_off()
-            self.assertIsNone(c.last_command_accepted)
-            if response[0] == 'ERR':
-                self.assertEqual(c.last_command['status'], 'rejected')
-                self.assertIsNone(c._pending)
+            await c.async_turn_off()
+            self.assertEqual(c.last_command['status'], 'pending')
+            self.assertEqual(c.last_command['acknowledgment'], 'received_unverified')
+            self.assertEqual(c.last_command['protocol_response'], response)
+        c = self.create()
+        self.reply(c, ['ERR', '0'])
+        with self.assertRaises(HAError):
+            await c.async_turn_off()
+        self.assertEqual(c.last_command['status'], 'rejected')
 
     async def test_on_and_unblock_confirm_only_observed_states(self):
         import json
@@ -398,3 +386,57 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['30017'][0], 66)
         self.assertEqual(c.data['30017'][0], 40)
         self.assertEqual(len(calls), 2)
+
+    async def test_frozen_cache_cannot_hide_stabilization_run_or_temperature_changes(self):
+        c = self.create()
+        c.direct_enabled = True
+        c._schedule_cache = lambda: None
+        current = [2, 40]
+        async def request(payload):
+            if payload == coordinator.DATA_QUERY:
+                return status(2, 40)  # Simulate the actual stale module cache.
+            return ['SEC', '3', *status(*current)[2:]]
+        c.transport.request = request
+        observed = []
+        for state, water in [(2,40),(3,45),(5,55),(6,65),(7,62),(0,35)]:
+            current[:] = [state, water]
+            c.data = await c._async_update_data()
+            observed.append((c.data['30001'][0], c.data['30017'][0]))
+        self.assertEqual(observed, [(2,40),(3,45),(5,55),(6,65),(7,62),(0,35)])
+        await c.async_shutdown()
+
+    async def test_noncritical_cache_cannot_overwrite_new_board_state(self):
+        c = self.create()
+        c.data = {'30001':[5,'J'], '30002':[0,'J'], '30017':[65,'J']}
+        c.last_successful_update = coordinator.utcnow()
+        last = c.last_successful_update
+        async def request(payload):
+            return ['SEL','4',*status(2,40)[2:],'B20813000000000006']
+        c.transport.request = request
+        await c._async_read_cache()
+        self.assertEqual(c.data['30001'][0],5)
+        self.assertEqual(c.data['30017'][0],65)
+        self.assertEqual(c.data['20813'][0],6)
+        self.assertEqual(c.last_successful_update,last)
+
+    async def test_direct_reads_continue_after_on_is_confirmed(self):
+        import json
+        c = self.create(); c.direct_enabled = True
+        c._schedule_cache = lambda: None
+        current = 2; reads = []
+        async def request(payload):
+            packet = json.loads(payload)
+            if packet[2].startswith('J'):
+                return ['SEC','0']
+            reads.append(payload)
+            return ['SEC','3',*status(current)[2:]]
+        c.transport.request = request
+        await c.async_turn_on()
+        c.data = await c._async_update_data()
+        self.assertIsNone(c._pending)
+        current = 3
+        c.data = await c._async_update_data()
+        current = 5
+        c.data = await c._async_update_data()
+        self.assertEqual(c.data['30001'][0],5)
+        self.assertEqual(len(reads),3)

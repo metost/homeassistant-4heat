@@ -78,6 +78,10 @@ class FourHeatTransport:
         self._phase = "idle"
         self._received_bytes = 0
 
+    @property
+    def busy(self):
+        return self._lock.locked()
+
     async def request(self, payload):
         validate_request(payload)
         # Cancellation while queued never releases another transaction's lock.
