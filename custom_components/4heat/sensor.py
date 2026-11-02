@@ -23,14 +23,21 @@ async def async_setup_entry(hass, entry, async_add_entities):
     entities = []
     sensorIds = entry.data[CONF_MONITORED_CONDITIONS]
 
+    seen_ids = set()
     for sensorId in sensorIds:
         if len(sensorId) > 5:
             try:
                 sId = sensorId[1:6]
+                if sId in seen_ids:
+                    continue
+                seen_ids.add(sId)
                 entities.append(FourHeatDevice(coordinator, sId, entry.title))
             except:
                 _LOGGER.debug(f"Error adding {sensorId}")
 
+    if coordinator.supplemental_enabled:
+        from .diagnostic_sensor import DESCRIPTIONS, FourHeatDiagnosticSensor
+        entities.extend(FourHeatDiagnosticSensor(coordinator, entry, key) for key in DESCRIPTIONS)
     async_add_entities(entities)
 
 
@@ -60,9 +67,15 @@ class FourHeatDevice(CoordinatorEntity):
         return f"{self._name} {self._sensor}"
 
     @property
+    def available(self):
+        """A partial startup snapshot need not contain every legacy field."""
+        return (self.coordinator.last_update_success and
+                self.type in (self.coordinator.data or {}))
+
+    @property
     def state(self):
         """Return the state of the device."""
-        if self.type not in self.coordinator.data:
+        if self.type not in (self.coordinator.data or {}):
             return None  # Evita di inviare valori non validi
 
         try:
@@ -99,7 +112,8 @@ class FourHeatDevice(CoordinatorEntity):
     @property
     def maker(self):
         """Maker information"""
-        return self.coordinator.data[self.type][1]
+        reading = (self.coordinator.data or {}).get(self.type)
+        return reading[1] if reading else None
 
     @property
     def unit_of_measurement(self):
@@ -127,7 +141,9 @@ class FourHeatDevice(CoordinatorEntity):
         }
 
     @property
-    def state_attributes(self):
+    def extra_state_attributes(self):
+        if self.type not in (self.coordinator.data or {}):
+            return None
         try:
             val = {ATTR_MARKER: self.coordinator.data[self.type][1]}
             val[ATTR_READING_ID] = self.type
@@ -136,6 +152,8 @@ class FourHeatDevice(CoordinatorEntity):
             if self.type == MODE_TYPE or self.type == ERROR_TYPE or self.type == POWER_TYPE:
                 val[ATTR_NUM_VAL] = self.coordinator.data[self.type][0]
                 
+            if self.type in (MODE_TYPE, ERROR_TYPE, "30017"):
+                val.update(self.coordinator.communication_attributes)
             return val
 
         except Exception as ex:

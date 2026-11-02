@@ -2,10 +2,12 @@
 # import logging
 
 import voluptuous as vol
+import asyncio
 import socket
 from requests.exceptions import HTTPError, ConnectTimeout
 
 from homeassistant import config_entries
+from .transport import FourHeatTransport, decode_registers
 import homeassistant.helpers.config_validation as cv
 
 from homeassistant.const import (
@@ -62,25 +64,20 @@ class FourHeatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return True
         return False
 
-    def _check_host(self, host) -> bool:
-        """Check if we can connect to the FourHeat."""
+    async def _check_host(self, host):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(SOCKET_TIMEOUT)
-            s.connect((host, TCP_PORT))
-            s.send(DATA_QUERY)
-            result= s.recv(SOCKET_BUFFER).decode()
-            s.close()
-            result = result.replace("]","")
-            result = result.replace('"',"")
-            self.conditions = result.split(",")
-            if len(self.conditions) > 3:
-                return True
-        except (ConnectTimeout, HTTPError):
+            response = await FourHeatTransport(host, TCP_PORT).request(DATA_QUERY)
+            decode_registers(response)
+            self.conditions = response[2:]
+            return True
+        except (OSError, asyncio.TimeoutError, ValueError):
             self._errors[CONF_HOST] = "could_not_connect"
             return False
 
-        return True
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return FourHeatOptionsFlow(config_entry)
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step."""
@@ -91,10 +88,8 @@ class FourHeatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 name = user_input[CONF_NAME]
                 host = user_input[CONF_HOST]
-                legacy_cmd = user_input[CONF_MODE]
-                can_connect = await self.hass.async_add_executor_job(
-                    self._check_host, host
-                )
+                legacy_cmd = user_input.get(CONF_MODE, False)
+                can_connect = await self._check_host(host)
                 if can_connect:
                     return self.async_create_entry(
                         title=f"{name}",
@@ -137,3 +132,32 @@ class FourHeatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._host_in_configuration_exists(user_input[CONF_HOST]):
             return self.async_abort(reason="host_exists")
         return await self.async_step_user(user_input)
+
+class FourHeatOptionsFlow(config_entries.OptionsFlow):
+    """Optional transport tuning; existing config entry data is untouched."""
+
+    def __init__(self, entry):
+        self._entry = entry
+
+    async def async_step_init(self, user_input=None):
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+        defaults = {"active_interval": 10, "idle_interval": 60,
+                    "transaction_timeout": 5, "connection_settle": 0.5, "transaction_gap": 1,
+                    "supplemental_interval": 30, "direct_interval": 10,
+                    "active_backoff_max": 60, "command_confirmation_timeout": 600}
+        ranges = {"active_interval": (6, 60), "idle_interval": (10, 300),
+                  "transaction_timeout": (1, 15), "connection_settle": (0, 1),
+                  "transaction_gap": (0, 5),
+                  "supplemental_interval": (10, 300), "direct_interval": (6, 300),
+                  "active_backoff_max": (10, 300), "command_confirmation_timeout": (60, 1800)}
+        schema = {}
+        for key, default in defaults.items():
+            numeric = float if key in ("connection_settle", "transaction_gap") else int
+            schema[vol.Required(key, default=self._entry.options.get(key, default))] = vol.All(
+                vol.Coerce(numeric), vol.Range(min=ranges[key][0], max=ranges[key][1]))
+        schema[vol.Optional("supplemental_telemetry", default=self._entry.options.get(
+            "supplemental_telemetry", False))] = bool
+        schema[vol.Optional("direct_telemetry", default=self._entry.options.get(
+            "direct_telemetry", False))] = bool
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

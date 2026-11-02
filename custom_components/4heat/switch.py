@@ -93,12 +93,13 @@ class FourHeatSwitch(CoordinatorEntity, SwitchEntity):
         }
 
     @property
-    def state_attributes(self):
+    def extra_state_attributes(self):
         try:
             if self.type == MODE_TYPE:
                 return {
                     "Num Val": self.coordinator.data[self.type][0],
-                    "Val text": MODE_NAMES[self.coordinator.data[self.type][0]]
+                    "Val text": MODE_NAMES[self.coordinator.data[self.type][0]],
+                    **self.coordinator.communication_attributes
                 }
             elif self.type == ERROR_TYPE:
                 return {"Num Val": self.coordinator.data[self.type][0]}
